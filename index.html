@@ -1,0 +1,316 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Student Attention Dashboard</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body class="min-h-screen bg-slate-950 text-slate-100">
+  <main class="mx-auto max-w-6xl px-4 py-8">
+    <header class="mb-6">
+      <h1 class="text-2xl font-semibold tracking-tight">Lecture Attention Analytics</h1>
+      <p class="mt-1 text-sm text-slate-400">Two-Stream CNN Inference Report</p>
+    </header>
+
+    <section class="grid grid-cols-1 gap-6 lg:grid-cols-3">
+      <article class="rounded-2xl border border-slate-800 bg-slate-900/60 p-4 lg:col-span-2">
+        <h2 class="mb-3 text-sm font-medium text-slate-300">Lecture Video</h2>
+        <video
+          id="lectureVideo"
+          class="aspect-video w-full rounded-xl border border-slate-800 bg-black"
+          controls
+          preload="metadata"
+          src="lecture 2.mp4"
+        ></video>
+      </article>
+
+      <article class="rounded-2xl border border-slate-800 bg-slate-900/60 p-5">
+        <h2 class="text-sm font-medium text-slate-300">Average Attention Score</h2>
+        <p id="avgScore" class="mt-4 text-5xl font-bold text-cyan-300">--</p>
+        <p class="mt-2 text-sm text-slate-400">Scale: 0 to 100</p>
+        <div class="mt-5 rounded-lg border border-slate-700 bg-slate-800/70 p-3 text-xs text-slate-300">
+          <p><span class="font-semibold text-red-300">Red points</span>: score below 50 (low attention)</p>
+          <p class="mt-1"><span class="font-semibold text-cyan-300">Click any point</span> to jump video to that timestamp.</p>
+        </div>
+      </article>
+    </section>
+
+    <section class="mt-6 rounded-2xl border border-slate-800 bg-slate-900/60 p-4">
+      <h2 class="mb-4 text-sm font-medium text-slate-300">Attention Over Time</h2>
+      <div class="h-[420px]">
+        <canvas id="attentionChart"></canvas>
+      </div>
+    </section>
+
+    <section class="mt-6 rounded-2xl border border-slate-800 bg-slate-900/60 p-4">
+      <h2 class="mb-4 text-sm font-medium text-slate-300">Heatmap At Selected Timestamp</h2>
+      <div class="grid grid-cols-1 gap-4 lg:grid-cols-3">
+        <article class="rounded-xl border border-slate-800 bg-slate-900/60 p-3 lg:col-span-2">
+          <img
+            id="activeHeatmap"
+            src=""
+            alt="Heatmap preview"
+            class="aspect-video w-full rounded-lg border border-slate-800 bg-slate-950 object-contain"
+          />
+        </article>
+        <article class="rounded-xl border border-slate-800 bg-slate-900/60 p-3">
+          <p class="text-xs uppercase tracking-wider text-slate-400">Selected Timestamp</p>
+          <p id="activeTimestamp" class="mt-2 text-2xl font-semibold text-cyan-300">--</p>
+          <p class="mt-3 text-xs text-slate-400">Heatmap file</p>
+          <p id="activeHeatmapName" class="mt-1 break-all text-sm text-slate-200">--</p>
+          <p id="videoSeekMode" class="mt-3 text-xs text-amber-300"></p>
+        </article>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    const videoEl = document.getElementById("lectureVideo");
+    const avgScoreEl = document.getElementById("avgScore");
+    const ctx = document.getElementById("attentionChart");
+    const activeHeatmapEl = document.getElementById("activeHeatmap");
+    const activeTimestampEl = document.getElementById("activeTimestamp");
+    const activeHeatmapNameEl = document.getElementById("activeHeatmapName");
+    const videoSeekModeEl = document.getElementById("videoSeekMode");
+    let attentionChart = null;
+    let analyticsRows = [];
+    let pendingSeekTime = null;
+    let lastHeatmapIndex = -1;
+
+    function computeAverage(values) {
+      if (!values.length) return 0;
+      const sum = values.reduce((a, b) => a + b, 0);
+      return Math.round((sum / values.length) * 10) / 10;
+    }
+
+    function clamp(value, min, max) {
+      return Math.min(Math.max(value, min), max);
+    }
+
+    function getHeatmapPath(row, index) {
+      if (row.heatmap_file) {
+        return normalizeHeatmapPath(row.heatmap_file);
+      }
+      const serial = String(index + 1).padStart(6, "0");
+      return `heatmaps/heatmap_${serial}.jpg`;
+    }
+
+    function normalizeHeatmapPath(rawPath) {
+      const safe = String(rawPath).replaceAll("\\", "/");
+      if (safe.startsWith("http://") || safe.startsWith("https://")) {
+        return safe;
+      }
+
+      // If inference wrote absolute filesystem path, map it to web-relative path.
+      const marker = "/Curswork/";
+      const markerIdx = safe.indexOf(marker);
+      if (markerIdx !== -1) {
+        return safe.slice(markerIdx + marker.length);
+      }
+
+      // Drive-path fallback: C:/.../data/heatmaps/...
+      const dataIdx = safe.indexOf("/data/");
+      if (dataIdx !== -1) {
+        return safe.slice(dataIdx + 1);
+      }
+
+      return safe;
+    }
+
+    function setActiveHeatmap(index) {
+      const row = analyticsRows[index];
+      if (!row) return;
+      if (index === lastHeatmapIndex) return;
+      lastHeatmapIndex = index;
+      const heatmapPath = getHeatmapPath(row, index);
+      activeHeatmapEl.src = heatmapPath;
+      activeTimestampEl.textContent = `${row.timestamp}s`;
+      activeHeatmapNameEl.textContent = heatmapPath;
+    }
+
+    function seekToTimestamp(timestamp) {
+      const applySeek = () => {
+        const duration = Number.isFinite(videoEl.duration) ? videoEl.duration : Number(timestamp);
+        const target = clamp(Number(timestamp), 0, duration > 0 ? duration : Number(timestamp));
+        videoEl.currentTime = target;
+      };
+
+      if (videoEl.readyState >= 1) {
+        applySeek();
+      } else {
+        pendingSeekTime = Number(timestamp);
+      }
+    }
+
+    function findNearestIndexByTimestamp(currentTime) {
+      if (!analyticsRows.length) return -1;
+      let bestIdx = 0;
+      let bestDist = Math.abs(currentTime - analyticsRows[0].timestamp);
+      for (let i = 1; i < analyticsRows.length; i += 1) {
+        const dist = Math.abs(currentTime - analyticsRows[i].timestamp);
+        if (dist < bestDist) {
+          bestDist = dist;
+          bestIdx = i;
+        }
+      }
+      return bestIdx;
+    }
+
+    function renderChart(rows) {
+      analyticsRows = rows;
+      lastHeatmapIndex = -1;
+      const scores = rows.map((row) => row.attention_score);
+      const avg = computeAverage(scores);
+      avgScoreEl.textContent = `${avg}`;
+
+      if (attentionChart) {
+        attentionChart.destroy();
+      }
+
+      attentionChart = new Chart(ctx, {
+        type: "line",
+        data: {
+          datasets: [
+            {
+              label: "Attention Score",
+              data: rows.map((row, index) => ({
+                x: Number(row.timestamp),
+                y: Number(row.attention_score),
+                pointIndex: index,
+              })),
+              borderColor: "#22d3ee",
+              borderWidth: 2,
+              tension: 0.25,
+              fill: true,
+              backgroundColor: "rgba(34, 211, 238, 0.1)",
+              pointRadius: 4,
+              pointHoverRadius: 6,
+              pointBackgroundColor: (context) => {
+                const value = context.raw.y;
+                return value < 50 ? "#ef4444" : "#22d3ee";
+              },
+            },
+          ],
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          interaction: {
+            mode: "nearest",
+            axis: "x",
+            intersect: true,
+          },
+          plugins: {
+            legend: {
+              labels: { color: "#cbd5e1" },
+            },
+            tooltip: {
+              callbacks: {
+                title: (items) => `Timestamp: ${items[0].raw.x}s`,
+                label: (item) => `Attention: ${item.raw.y}`,
+              },
+            },
+          },
+          scales: {
+            x: {
+              type: "linear",
+              title: { display: true, text: "Time (seconds)", color: "#cbd5e1" },
+              ticks: { color: "#cbd5e1" },
+              grid: { color: "rgba(148, 163, 184, 0.12)" },
+            },
+            y: {
+              min: 0,
+              max: 100,
+              title: { display: true, text: "Attention Score", color: "#cbd5e1" },
+              ticks: { color: "#cbd5e1" },
+              grid: { color: "rgba(148, 163, 184, 0.12)" },
+            },
+          },
+          onClick: (event, _elements, chart) => {
+            const points = chart.getElementsAtEventForMode(
+              event,
+              "nearest",
+              { intersect: true },
+              true
+            );
+            if (!points.length) return;
+            const idx = points[0].index;
+            const point = chart.data.datasets[0].data[idx];
+            const ts = Number(point.x);
+            seekToTimestamp(ts);
+            setActiveHeatmap(idx);
+          },
+        },
+      });
+
+      if (rows.length > 0) {
+        setActiveHeatmap(0);
+      }
+    }
+
+    async function init() {
+      try {
+        const response = await fetch("report.json", { cache: "no-store" });
+        if (!response.ok) {
+          throw new Error(`Failed to load report.json (${response.status})`);
+        }
+        const report = await response.json();
+        await configureVideoSource(report.video_name);
+        const rows = Array.isArray(report.analytics) ? report.analytics : [];
+        renderChart(rows);
+      } catch (err) {
+        avgScoreEl.textContent = "N/A";
+        console.error(err);
+        alert("Could not load report.json. Run a local server and ensure report.json exists.");
+      }
+    }
+
+    videoEl.addEventListener("timeupdate", () => {
+      const idx = findNearestIndexByTimestamp(videoEl.currentTime);
+      if (idx >= 0) {
+        setActiveHeatmap(idx);
+      }
+    });
+
+    videoEl.addEventListener("loadedmetadata", () => {
+      if (pendingSeekTime !== null) {
+        seekToTimestamp(pendingSeekTime);
+        pendingSeekTime = null;
+      }
+    });
+
+    async function configureVideoSource(videoName) {
+      const targetVideo = videoName || videoEl.getAttribute("src") || "lecture.mp4";
+      const headResp = await fetch(targetVideo, { method: "HEAD", cache: "no-store" });
+      const acceptRanges = (headResp.headers.get("Accept-Ranges") || "").toLowerCase();
+
+      // If the local server cannot do range requests, load full blob so forward seeking works.
+      if (!acceptRanges.includes("bytes")) {
+        videoSeekModeEl.textContent = "Seek mode: loading full video into memory (server has no byte-range support)";
+        const fullResp = await fetch(targetVideo, { cache: "no-store" });
+        if (!fullResp.ok) {
+          throw new Error(`Failed to load video file (${fullResp.status})`);
+        }
+        const blob = await fullResp.blob();
+        const blobUrl = URL.createObjectURL(blob);
+        videoEl.setAttribute("src", blobUrl);
+        videoEl.load();
+      } else {
+        videoSeekModeEl.textContent = "Seek mode: byte-range streaming";
+        if (videoEl.getAttribute("src") !== targetVideo) {
+          videoEl.setAttribute("src", targetVideo);
+          videoEl.load();
+        }
+      }
+    }
+
+    activeHeatmapEl.addEventListener("error", () => {
+      activeHeatmapNameEl.textContent = `${activeHeatmapNameEl.textContent} (failed to load)`;
+    });
+
+    init();
+  </script>
+</body>
+</html>
